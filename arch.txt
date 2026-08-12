@@ -1,0 +1,624 @@
+Some architecture suggestions from ChatGPT:
+
+Use normalized SQLite tables:
+
+workspaces
+chats
+agents
+messages
+runs
+model_calls
+tool_calls
+artifacts
+message_artifacts
+watchers
+agent_mail
+events
+settings
+
+workspace
+  └── chat
+       ├── agent
+       │    ├── run
+       │    │    ├── model_call
+       │    │    └── tool_call
+       │    └── watcher
+       │
+       └── message ─── parent_message_id
+                       │
+                       └── creates conversation DAG
+
+artifact
+  └── message_artifact
+
+agent_mail
+  ├── sender_agent
+  └── recipient_agent
+
+Use SQLite WAL mode and ordinary SQL migrations.
+
+I'd also have:
+
+events(
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp,
+    type,
+    entity_type,
+    entity_id,
+    payload_json
+)
+
+This is the durable event/audit backbone.
+
+
+
+3. Conversations should be DAGs
+
+Do not implement branching by copying a conversation.
+
+Every message gets:
+
+id
+chat_id
+parent_message_id
+author
+content
+...
+
+Suppose:
+
+A → B → C → D
+        \
+         E → F
+
+Those are two branches sharing the same history.
+
+To construct model context at F, walk:
+
+F ← E ← B ← A
+
+and reverse it.
+
+This makes "branch from any point" nearly free and ensures changing one branch never mutates another.
+
+You don't really need a first-class branch table at all initially. A branch is simply a path through the message DAG. You may later add named branch pointers purely as UI metadata.
+
+
+
+
+---
+
+5. Give the agent a very small tool language
+
+I would start with approximately this:
+
+read_file
+list_files
+search_files
+write_file
+apply_patch
+
+exec
+kill_process
+
+web_search
+web_fetch
+
+send_agent_message
+
+create_watcher
+cancel_watcher
+
+present_artifact
+
+Possibly:
+
+mkdir
+remove
+move
+
+That's enough to do almost everything.
+
+apply_patch is particularly important
+
+The normal path for editing code should be:
+
+read → apply_patch → test
+
+not rewriting whole files.
+
+Make apply_patch take an expected file hash:
+
+{
+  "path": "src/foo.py",
+  "expected_sha256": "abc...",
+  "patch": "..."
+}
+
+If another agent or the user has changed the file meanwhile:
+
+PATCH_CONFLICT
+
+src/foo.py changed since it was read.
+
+Expected: abc...
+Current:  def...
+No changes were applied.
+
+That single mechanism eliminates a large class of horrible multi-agent races.
+
+
+---
+
+
+7. Make command execution unusually good
+
+A coding harness lives or dies on this.
+
+Each call should retain:
+
+command/argv
+cwd
+selected environment changes
+PID
+start/end timestamp
+exit code / signal
+stdout
+stderr
+truncated?
+
+And support cancellation.
+
+When the user presses:
+
+Stop
+
+you should kill the whole process group, not merely the immediate process.
+
+Also distinguish:
+
+exec(["pytest", "-q"])
+
+from:
+
+shell("cat foo | grep bar")
+
+An argv-based exec is preferable when possible. Keep shell as an explicitly shell-interpreted tool if agents need pipelines.
+
+----
+
+
+8. Large tool outputs must not destroy the context
+
+This is easy to overlook.
+
+Suppose the model runs:
+
+npm test
+
+and gets 4 MB of output.
+
+Do not stuff 4 MB back into the model context.
+
+Store the complete output as an artifact, and return something like:
+
+Process exited 1.
+
+stdout: 3.8 MB
+stderr: 41 KB
+
+Showing final 200 lines:
+...
+
+Full output: artifact://01J...
+
+You can similarly support:
+
+read_artifact(id, start_line, end_line)
+
+if necessary.
+
+This will massively improve long-running agent performance.
+
+---
+
+
+9. Treat artifacts as immutable snapshots, not merely workspace paths
+
+This is another thing I would add to your proposal.
+
+Suppose an agent generates:
+
+plots/e4.png
+
+and displays it.
+
+Three hours later it overwrites plots/e4.png.
+
+The old chat message should still show the old image.
+
+So:
+
+workspace file != artifact
+
+present_artifact("plots/e4.png") should snapshot it into content-addressed storage:
+
+artifact
+  sha256
+  MIME type
+  byte length
+  original path
+  creator run
+
+Then messages refer to:
+
+artifact://01931...
+
+not plots/e4.png.
+
+Images render inline.
+
+Downloads become links.
+
+HTML gets an interactive frame.
+
+History remains reproducible.
+
+
+----
+
+
+11. Multi-agent communication should be a mailbox, not shared context
+
+I'd make:
+
+send_agent_message(
+    recipient="proof-checker",
+    message="Can you verify lemma 4?",
+    wake=true
+)
+
+create a durable mailbox record.
+
+Crucially, if the other agent is currently generating, do not inject the message midway through its run.
+
+Instead:
+
+Agent B running
+      ↓
+message arrives
+      ↓
+mailbox queued
+      ↓
+current run finishes
+      ↓
+new run triggered with queued mail
+
+That makes each model invocation deterministic and understandable.
+
+The UI can show:
+
+Alice → Bob
+14:42
+"Please check src/parser.py..."
+
+as an ordinary inspectable event.
+
+---
+
+12. Put brakes on agent cascades
+
+If A wakes B, B wakes C, and C wakes A, you have accidentally built a perpetual-motion token burner.
+
+Every induced run should carry a causal chain:
+
+user
+└─ run A
+   └─ mail to B
+      └─ run B
+         └─ mail to C
+            └─ run C
+
+Then enforce configurable limits such as:
+
+maximum cascade depth: 8
+maximum auto-runs per user turn: 20
+maximum agents simultaneously running: 4
+
+When hit, queue the work and tell the user exactly why.
+
+Do not silently stop it.
+
+---
+
+13. Watchers should separate trigger detection from AI reasoning
+
+Rather than allowing a model to invent arbitrary background loops, give it deterministic triggers.
+
+I would initially implement only:
+
+timer
+file_change
+
+For example:
+
+{
+  "type": "file_change",
+  "path": "results/*.json",
+  "debounce_ms": 1000,
+  "prompt": "New experiment results arrived. Analyse them and continue the task."
+}
+
+or:
+
+{
+  "type": "timer",
+  "after_seconds": 600,
+  "prompt": "Check whether the server has finished starting."
+}
+
+Persist watchers in SQLite so restarting the harness doesn't forget them.
+
+For files, save the previous state/hash and trigger only on a transition.
+
+Also add:
+
+debounce
+one_shot
+minimum_interval
+enabled
+last_triggered_at
+
+Otherwise compiler outputs can trigger hundreds of agent invocations.
+
+---
+
+14. One mutable workspace introduces an important concurrency issue
+
+If several agents can operate on the same repository, eventually two will edit the same thing.
+
+I would support two modes.
+
+Default:
+
+Shared workspace
+
+Multiple agents can reason concurrently, but mutating operations carry file version preconditions.
+
+Advanced:
+
+Git worktree per agent
+
+For example:
+
+main repo
+
+.worktrees/
+    alice/
+    bob/
+    reviewer/
+
+Agents can then genuinely work in parallel and return commits for merging.
+
+That would be a very valuable second-stage feature.
+
+---
+
+
+15. Use SSE between the backend and browser
+
+You don't actually need WebSockets for the first version.
+
+Browser → backend:
+
+ordinary HTTP POST
+
+Backend → browser:
+
+SSE
+
+For example:
+
+GET /api/events?after=9381
+
+produces:
+
+run.started
+model.delta
+tool.started
+tool.output
+tool.finished
+model.delta
+message.completed
+
+Each event gets an increasing SQLite sequence number.
+
+If the browser reloads after event 9381:
+
+GET /api/events?after=9381
+
+and it catches up.
+
+That is extremely simple and robust.
+
+Synthetic itself streams Chat Completions using SSE, so the backend can essentially normalize one streaming event source into your own event stream.
+
+---
+
+16. Context management should be visible
+
+I very strongly agree with your end-of-context idea, but I'd push it further.
+
+Put a permanent meter in the chat header:
+
+Context
+██████████████░░░░░░  68%
+~83k / 128k
+
+Then thresholds:
+
+70%  merely visible
+85%  warning
+92%  offer handoff
+
+The user can click:
+
+Create continuation
+
+and the current agent produces a structured handoff:
+
+---
+
+19. Make retries conservative
+
+One unpleasant agent bug is:
+
+tool succeeds
+connection fails
+harness retries
+tool executes twice
+
+Every tool call therefore needs its own durable ID.
+
+Persist:
+
+tool_call: pending
+
+before execution, then:
+
+running
+
+then:
+
+completed
+
+and persist its result before making the next model request.
+
+Following a crash:
+
+status = running
+
+becomes:
+
+status = interrupted
+
+Do not automatically rerun it.
+
+Let the user or agent explicitly decide.
+
+This matters for:
+
+git push
+rm
+database changes
+deployments
+sending messages
+
+as much as it does for ordinary code edits.
+
+---
+
+20. Web tools
+
+Synthetic already provides a search API aimed at coding-agent use that returns URL, title, text and publication metadata. I'd therefore implement:
+
+web_search(query)
+
+through Synthetic initially.
+
+Then separately:
+
+web_fetch(url)
+
+in your backend.
+
+web_fetch should have explicit:
+
+timeout
+maximum redirects
+maximum bytes
+allowed MIME types
+
+and block private/link-local addresses by default so a webpage-fetch tool cannot casually become an SSRF route into local services.
+
+For page extraction, I would start with a tiny HTML parser and add a proper readability extractor only if the primitive version proves inadequate. This is one place where avoiding a dependency at all costs may ultimately harm agent performance.
+
+---
+
+23. Artifact presentation deserves a tiny tool of its own
+
+I really like:
+
+present_artifact
+
+For example:
+
+{
+  "path": "out/e4.png",
+  "title": "E₄ on the Poincaré disk",
+  "mode": "inline"
+}
+
+or:
+
+{
+  "path": "visualization/index.html",
+  "title": "Interactive modular-form explorer",
+  "mode": "interactive"
+}
+
+That is better than having the frontend inspect arbitrary Markdown links and guess the model's intention.
+
+You can still allow:
+
+![plot](artifact://...)
+
+as a convenient internal representation.
+
+---
+
+25. Export should preserve more than messages
+
+A selected-branch export could look conceptually like:
+
+{
+  "schema_version": 1,
+  "workspace": {},
+  "chat": {},
+  "messages": [],
+  "runs": [],
+  "model_calls": [],
+  "tool_calls": [],
+  "agents": [],
+  "watchers": [],
+  "artifact_manifest": []
+}
+
+For "export everything", I would additionally support:
+
+chat-export.zip
+├── conversation.json
+└── artifacts/
+    ├── ...
+    └── ...
+
+Use schema versions from day one.
+
+---
+
+Run/model-call/tool-call provenance, rather than treating an assistant message as the unit of execution.
+A message DAG as the primitive for branching.
+Immutable presented artifacts, distinct from mutable repo files.
+Context accounting and visible handoffs, with no invisible compaction.
+Cancellation and proper subprocess process-group management.
+Crash-safe/idempotent tool-call state.
+Multi-agent concurrency protection, preferably hash-preconditioned patches first and Git worktrees later.
+A durable event journal + SSE reconnect protocol.
+Sandboxed HTML artifacts and safe SVG/image presentation.
+Explicit raw request/provenance inspection, including exact requested/resolved models.
+Mailbox semantics and cascade limits for agent-to-agent work.
+Watcher debounce/persistence, rather than generic model-controlled loops.
+Full-output artifacts with truncated context results, so build logs don't consume the context.
+Git-state snapshots before/after runs.
+Structured machine-readable errors everywhere.
+
