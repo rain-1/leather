@@ -3,6 +3,8 @@ We want this to be as minimal in terms of dependencies as possible
 The agents will run starting in a directory on your local computer, starting a chat will require picking a location to work in
 settings like this will be visible and apparent to the user
 
+Consider the user of the software to be a technical expert. They want to know exactly what is going on. Error messages should be reported clearly.
+
 We want a clean design, meaningfully decompose the implementation into self contained files, use only essential and common libraries to implement this
 
 The agent needs to be able to execute tool calls, primarily:
@@ -11,6 +13,7 @@ The agent needs to be able to execute tool calls, primarily:
 * run commands (e.g. build and run the code, test it, git commit, etc.)
 * agents have names and there is a channel for them to communicate with each other (basically just queue up prompts for each other)
 * ability for the agent to set prompted 'watchers' e.g. a timer, or observe some file change and get triggered by it to continue working
+* maybe some kind of trigger when you get near the end of context which asks the user if they would like the model to spin off a new chat with a prompt that summarizes everything important and relevant to the current task.
 
 in terms of user interface, we primarily want to have work from a web interface that connects to a separate backend service that manages the agents (meaning handles the streaming of the API calls and also launching off the processes and capturing the output to give back to the agents)
 * dashboard that shows every agent and which chat they are part of
